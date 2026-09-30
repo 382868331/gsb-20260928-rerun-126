@@ -15,8 +15,14 @@ type Position struct {
 // Record is a valid log record made available to an output.
 type Record struct {
 	Position Position
-	Raw      []byte
-	Fields   map[string]any
+	// ID is the stable identity of one record inside a stream. It is derived
+	// only from the physical source location (file identity plus byte range),
+	// so the very same input bytes replayed after a crash carry the very same
+	// ID. Receivers MUST treat ID as their idempotency key and suppress
+	// duplicates: delivery is at-least-once, not exactly-once.
+	ID     string
+	Raw    []byte
+	Fields map[string]any
 }
 
 // BadRecord preserves the location of unusable input but intentionally does not

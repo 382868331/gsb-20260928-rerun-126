@@ -1,3 +1,27 @@
+// Package logengine tails log files and hands parsed records to an Output.
+//
+// Delivery and acknowledgement semantics:
+//
+//   - Publishing records and persisting the read checkpoint are two INDEPENDENT
+//     writes to two different systems. There is no ordering in which the pair
+//     commits atomically, and this package never claims otherwise.
+//   - On each batch the call order is strictly: read -> Publish -> persist
+//     checkpoint. The checkpoint advances only after Publish returns nil.
+//   - If Publish fails, nothing is acknowledged: the same records are read and
+//     published again on the next Pump (after restart or within the process).
+//   - If Publish succeeds but the checkpoint write fails, the records are
+//     already delivered and MUST NOT be published a second time within this
+//     process; Pump keeps them pending and only retries the checkpoint write.
+//   - After a crash in that window the checkpoint is stale, so recovery reads
+//     and republishes the tail. Every Record therefore carries a stable ID
+//     (see [Record.ID]) derived from stream, file identity and byte range, and
+//     every Output MUST use that ID as its idempotency key so a redelivery
+//     never creates a second business record.
+//
+// Rotation is detected by (device, inode): a path replaced by a different file
+// is read from offset zero of the new file. Truncation is reported as a
+// redacted BadRecord carrying only the position and reason, and reading
+// restarts at zero of the truncated file.
 package logengine
 
 import (
@@ -10,9 +34,21 @@ import (
 var (
 	errFileRotated        = errors.New("file rotated")
 	errTruncationDetected = errors.New("truncation detected")
+
+	// ErrCheckpointNotSaved wraps a checkpoint persistence failure that happens
+	// after Publish has already succeeded. The records are delivered; callers
+	// must keep the engine alive and retry Pump rather than treat this as a
+	// publish failure.
+	ErrCheckpointNotSaved = errors.New("checkpoint not saved")
 )
 
 type Output interface {
+	// Publish makes a batch of records durable at the receiver. It MUST be
+	// idempotent with respect to Record.ID: the engine provides at-least-once
+	// delivery and may present the same ID more than once across retries.
+	// Returning an error means the batch is not confirmed; nothing will be
+	// acknowledged and the batch will be retried. The input slice is owned by
+	// the engine and must not be retained.
 	Publish(events []Event) error
 }
 
@@ -34,6 +70,10 @@ type Engine struct {
 	dropOversize bool
 	resetCommit  bool
 	pending      []Event
+	// delivered is true once Publish has succeeded for pending but the
+	// checkpoint save has not yet confirmed. While true, Pump retries only the
+	// checkpoint write instead of publishing the same records again.
+	delivered bool
 }
 
 type Option func(*Engine)
@@ -214,6 +254,7 @@ func (e *Engine) finishCurrentFile(output Output) error {
 	e.safeOffset = 0
 	e.nextLine = 0
 	e.carryStart = 0
+	e.id = FileID{}
 	if len(events) > 0 {
 		e.pending = append(e.pending, events...)
 		if err := e.publish(output); err != nil {
@@ -261,9 +302,13 @@ func (e *Engine) ensureOpen() error {
 }
 
 func (e *Engine) resetAfterTruncation(currentSize int64) error {
+	if e.file != nil {
+		_ = e.file.Close()
+		e.file = nil
+	}
 	e.parser.Reset()
 	e.pending = append(e.pending, BadRecord{
-		Position: Position{Stream: e.stream, Start: e.states[e.stream].Offset, End: currentSize, Line: e.states[e.stream].NextLine},
+		Position: Position{Stream: e.stream, FileID: e.id, Start: e.states[e.stream].Offset, End: currentSize, Line: e.states[e.stream].NextLine},
 		Reason:   "file_truncated",
 	})
 	cp := e.states[e.stream]
@@ -366,10 +411,24 @@ func (e *Engine) handleEnd() error {
 }
 
 func (e *Engine) publish(output Output) error {
-	if err := output.Publish(e.pending); err != nil {
-		return err
+	if !e.delivered {
+		// Publish and checkpoint persist are independent writes. A failure here
+		// means nothing was confirmed: keep the batch pending and let the next
+		// Pump (or a restarted process) read and publish it again.
+		if err := output.Publish(e.pending); err != nil {
+			return err
+		}
+		// The output is now confirmed. If the checkpoint write below fails we
+		// must not publish this batch again in-process; recovery relies on the
+		// stable Record.ID and receiver-side deduplication instead.
+		e.delivered = true
 	}
-	return e.ack(e.pending)
+	if err := e.ack(e.pending); err != nil {
+		return fmt.Errorf("%w: %v", ErrCheckpointNotSaved, err)
+	}
+	e.delivered = false
+	e.pending = e.pending[:0]
+	return nil
 }
 
 func (e *Engine) saveReadPosition() error {
@@ -425,6 +484,7 @@ func (e *Engine) ack(events []Event) error {
 	if err := e.store.Save(e.states); err != nil {
 		return err
 	}
+	e.delivered = false
 	e.pending = e.pending[:0]
 	return nil
 }
@@ -434,6 +494,7 @@ func enrichEvent(event Event, stream string, id FileID) Event {
 	case Record:
 		v.Position.Stream = stream
 		v.Position.FileID = id
+		v.ID = stableRecordID(stream, id, v.Position.Start, v.Position.End)
 		return v
 	case BadRecord:
 		v.Position.Stream = stream

@@ -15,6 +15,12 @@ type Checkpoint struct {
 }
 
 // StateStore stores the highest fully confirmed byte offset for each stream.
+//
+// A checkpoint only records what was already confirmed by the Output; saving
+// it is a separate write from publishing and the two are never atomic. Save
+// uses a temp-file rename so a crash during the write leaves the previous
+// checkpoint intact. Recovery after a failed save redelivers the tail, which
+// is why Outputs must deduplicate on Record.ID.
 type StateStore struct {
 	path string
 }
