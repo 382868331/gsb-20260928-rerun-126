@@ -2,7 +2,6 @@ package logengine
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"os"
 )
@@ -13,13 +12,20 @@ var (
 )
 
 type Output interface {
+	// Publish receives a batch with stable event IDs. It must be idempotent:
+	// after it has returned nil once, an engine crash before the checkpoint is
+	// cleared can cause the same batch and IDs to be retried after restart.
+	// A returned error is treated as uncertain, including if the write reached
+	// the receiver; the engine cannot infer atomic completion of two separate
+	// systems, so receivers must dedupe instead of creating a second business
+	// record for an already-applied ID.
 	Publish(events []Event) error
 }
 
 type Engine struct {
 	stream       string
 	path         string
-	store        *StateStore
+	store        checkpointStore
 	parser       StreamingParser
 	maxLine      int
 	readSize     int
@@ -34,9 +40,15 @@ type Engine struct {
 	dropOversize bool
 	resetCommit  bool
 	pending      []Event
+	pendingCP    Checkpoint
 }
 
 type Option func(*Engine)
+
+type checkpointStore interface {
+	Load() (map[string]Checkpoint, error)
+	Save(states map[string]Checkpoint) error
+}
 
 func WithMaxLineBytes(n int) Option {
 	return func(e *Engine) { e.maxLine = n }
@@ -44,6 +56,10 @@ func WithMaxLineBytes(n int) Option {
 
 func WithReadSize(n int) Option {
 	return func(e *Engine) { e.readSize = n }
+}
+
+func WithCheckpointStore(store checkpointStore) Option {
+	return func(e *Engine) { e.store = store }
 }
 
 func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts ...Option) (*Engine, error) {
@@ -55,7 +71,7 @@ func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts
 	e := &Engine{
 		stream:   stream,
 		path:     path,
-		store:    store,
+		store:    checkpointStore(store),
 		parser:   parser,
 		maxLine:  1 << 20,
 		readSize: 4096,
@@ -64,6 +80,15 @@ func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts
 	for _, opt := range opts {
 		opt(e)
 	}
+	if e.store == nil {
+		e.store = store
+	} else if e.store != store {
+		states, err = e.store.Load()
+		if err != nil {
+			return nil, err
+		}
+		e.states = states
+	}
 	if e.maxLine < 1 {
 		return nil, errors.New("max line bytes must be positive")
 	}
@@ -71,17 +96,18 @@ func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts
 		return nil, errors.New("read size must be positive")
 	}
 	if cp, ok := states[stream]; ok {
-		if sp, ok := parser.(StatefulParser); ok && len(cp.ParserState) > 0 {
-			var state any
-			// MultilineParser owns the concrete state shape in this first version.
-			if _, ok := sp.(*MultilineParser); ok {
-				var ms multilineState
-				if err := jsonUnmarshal(cp.ParserState, &ms); err != nil {
-					return nil, fmt.Errorf("restore parser state: %w", err)
+		if cp.Pending != nil {
+			e.pending = restoreEvents(cp.Pending.Events)
+			e.pendingCP = cp
+			if sp, ok := parser.(StatefulParser); ok && len(cp.Pending.ParserState) > 0 {
+				if err := restoreMultilineState(sp, cp.Pending.ParserState); err != nil {
+					return nil, err
 				}
-				state = ms
 			}
-			sp.Restore(state)
+		} else if sp, ok := parser.(StatefulParser); ok && len(cp.ParserState) > 0 {
+			if err := restoreMultilineState(sp, cp.ParserState); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return e, nil
@@ -127,10 +153,10 @@ func (e *Engine) Pump(output Output) error {
 			if statErr != nil && !os.IsNotExist(statErr) {
 				return 0, statErr
 			}
-			if statErr == nil && id != e.id {
+			if statErr == nil && !id.SameFile(e.id) {
 				return 0, errFileRotated
 			}
-			if statErr == nil && id == e.id && info.Size() < e.safeOffset {
+			if statErr == nil && id.SameFile(e.id) && info.Size() < e.safeOffset {
 				if err := e.resetAfterTruncation(info.Size()); err != nil {
 					return 0, err
 				}
@@ -157,10 +183,10 @@ func (e *Engine) Pump(output Output) error {
 		}
 		if errors.Is(err, io.EOF) {
 			id, info, statErr := fileIDFromPath(e.path)
-			if statErr == nil && id != e.id {
+			if statErr == nil && !id.SameFile(e.id) {
 				return e.finishCurrentFile(output)
 			}
-			if statErr == nil && id == e.id && info.Size() < e.safeOffset {
+			if statErr == nil && id.SameFile(e.id) && info.Size() < e.safeOffset {
 				if err := e.resetAfterTruncation(info.Size()); err != nil {
 					return err
 				}
@@ -233,7 +259,7 @@ func (e *Engine) ensureOpen() error {
 	}
 	cp := e.states[e.stream]
 	start := int64(0)
-	if cp.FileID == id {
+	if cp.FileID.SameFile(id) {
 		if info.Size() < cp.Offset {
 			return e.resetAfterTruncation(info.Size())
 		}
@@ -349,7 +375,7 @@ func (e *Engine) handleEnd() error {
 	if err != nil {
 		return err
 	}
-	if id == e.id {
+	if id.SameFile(e.id) {
 		if info.Size() < e.safeOffset {
 			return e.resetAfterTruncation(info.Size())
 		}
@@ -366,6 +392,11 @@ func (e *Engine) handleEnd() error {
 }
 
 func (e *Engine) publish(output Output) error {
+	if e.pendingCP.Pending == nil {
+		if err := e.stagePending(); err != nil {
+			return err
+		}
+	}
 	if err := output.Publish(e.pending); err != nil {
 		return err
 	}
@@ -377,18 +408,63 @@ func (e *Engine) saveReadPosition() error {
 	cp.FileID = e.id
 	cp.Offset = e.safeOffset
 	cp.NextLine = e.nextLine
-	if sp, ok := e.parser.(StatefulParser); ok {
-		raw, err := jsonMarshal(sp.Capture())
-		if err != nil {
-			return err
-		}
-		cp.ParserState = raw
+	raw, err := parserStateForCheckpoint(e.parser)
+	if err != nil {
+		return err
 	}
+	cp.ParserState = raw
+	cp.Pending = nil
 	e.states[e.stream] = cp
 	return e.store.Save(e.states)
 }
 
-func (e *Engine) ack(events []Event) error {
+func (e *Engine) stagePending() error {
+	raw, err := parserStateForCheckpoint(e.parser)
+	if err != nil {
+		return err
+	}
+	cp := e.states[e.stream]
+	cp.Pending = &PendingBatch{
+		FileID:      e.id,
+		Offset:      e.safeOffset,
+		NextLine:    e.nextLine,
+		ParserState: raw,
+		Reset:       e.resetCommit,
+		Events:      persistEvents(e.pending),
+	}
+	e.states[e.stream] = cp
+	e.pendingCP = cp
+	return e.store.Save(e.states)
+}
+
+func (e *Engine) ack(_ []Event) error {
+	cp, ok := e.states[e.stream]
+	if !ok || cp.Pending == nil {
+		cp = e.pendingCP
+	}
+	if cp.Pending != nil {
+		reset := cp.Pending.Reset
+		if reset {
+			cp = Checkpoint{}
+		} else {
+			cp = committedCheckpointFromPending(cp)
+		}
+		e.states[e.stream] = cp
+		if err := e.store.Save(e.states); err != nil {
+			return err
+		}
+		if reset {
+			e.id = FileID{}
+			e.offset = 0
+			e.safeOffset = 0
+			e.nextLine = 0
+		}
+		e.resetCommit = false
+		e.pendingCP = Checkpoint{}
+		e.pending = e.pending[:0]
+		return nil
+	}
+
 	if e.resetCommit {
 		cp := e.states[e.stream]
 		cp.FileID = FileID{}
@@ -408,20 +484,16 @@ func (e *Engine) ack(events []Event) error {
 		return nil
 	}
 
-	cp := e.states[e.stream]
-	cp.FileID = e.id
-	cp.Offset = e.safeOffset
-	cp.NextLine = e.nextLine
-	if sp, ok := e.parser.(StatefulParser); ok {
-		raw, err := jsonMarshal(sp.Capture())
-		if err != nil {
-			return err
-		}
-		cp.ParserState = raw
-	} else {
-		cp.ParserState = nil
+	committedCP := e.states[e.stream]
+	committedCP.FileID = e.id
+	committedCP.Offset = e.safeOffset
+	committedCP.NextLine = e.nextLine
+	raw, err := parserStateForCheckpoint(e.parser)
+	if err != nil {
+		return err
 	}
-	e.states[e.stream] = cp
+	committedCP.ParserState = raw
+	e.states[e.stream] = committedCP
 	if err := e.store.Save(e.states); err != nil {
 		return err
 	}
@@ -434,10 +506,12 @@ func enrichEvent(event Event, stream string, id FileID) Event {
 	case Record:
 		v.Position.Stream = stream
 		v.Position.FileID = id
+		v.ID = v.Position.EventID()
 		return v
 	case BadRecord:
 		v.Position.Stream = stream
 		v.Position.FileID = id
+		v.ID = v.Position.EventID()
 		return v
 	}
 	return event

@@ -6,10 +6,11 @@ import (
 	"syscall"
 )
 
-// FileID identifies a physical inode rather than a potentially reused path.
+// FileID identifies one physical file incarnation rather than a reused path.
 type FileID struct {
-	Device uint64 `json:"device"`
-	Inode  uint64 `json:"inode"`
+	Device      uint64 `json:"device"`
+	Inode       uint64 `json:"inode"`
+	ChangeNanos uint64 `json:"change_nanos,omitempty"`
 }
 
 func fileIDFromFile(f *os.File) (FileID, error) {
@@ -35,11 +36,19 @@ func fileIDFromInfo(st os.FileInfo) (FileID, error) {
 		return FileID{}, fmt.Errorf("unsupported file information type %T", st.Sys())
 	}
 	return FileID{
-		Device: uint64(sys.Dev),
-		Inode:  uint64(sys.Ino),
+		Device:      uint64(sys.Dev),
+		Inode:       uint64(sys.Ino),
+		ChangeNanos: uint64(sys.Ctim.Nano()),
 	}, nil
 }
 
 func (id FileID) String() string {
-	return fmt.Sprintf("dev=%d inode=%d", id.Device, id.Inode)
+	return fmt.Sprintf("dev=%d inode=%d change=%d", id.Device, id.Inode, id.ChangeNanos)
+}
+
+// SameFile reports whether two identities refer to the same device/inode.
+// Metadata-time changes on that inode are handled as truncation/reset checks,
+// not as path rotation.
+func (id FileID) SameFile(other FileID) bool {
+	return id.Device == other.Device && id.Inode == other.Inode
 }
