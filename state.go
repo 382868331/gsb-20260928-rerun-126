@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 type Checkpoint struct {
@@ -23,10 +24,26 @@ type Checkpoint struct {
 // is why Outputs must deduplicate on Record.ID.
 type StateStore struct {
 	path string
+	mu   sync.Mutex
 }
 
+// sharedStores hands the same *StateStore to every engine using one checkpoint
+// path, so concurrent streams tracked in a single process never overwrite each
+// other's confirmed positions.
+var (
+	sharedStoresMu sync.Mutex
+	sharedStores   = map[string]*StateStore{}
+)
+
 func NewStateStore(path string) *StateStore {
-	return &StateStore{path: path}
+	sharedStoresMu.Lock()
+	defer sharedStoresMu.Unlock()
+	if store, ok := sharedStores[path]; ok {
+		return store
+	}
+	store := &StateStore{path: path}
+	sharedStores[path] = store
+	return store
 }
 
 func (s *StateStore) Load() (map[string]Checkpoint, error) {
@@ -47,7 +64,21 @@ func (s *StateStore) Load() (map[string]Checkpoint, error) {
 	return states, nil
 }
 
-func (s *StateStore) Save(states map[string]Checkpoint) error {
+// SaveStream persists the confirmed checkpoint for one stream. It merges into
+// the on-disk state under a lock instead of rewriting a stale in-memory map,
+// so saving stream A never rolls back the checkpoint of stream B.
+func (s *StateStore) SaveStream(stream string, cp Checkpoint) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	states, err := s.Load()
+	if err != nil {
+		return err
+	}
+	states[stream] = cp
+	return s.save(states)
+}
+
+func (s *StateStore) save(states map[string]Checkpoint) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}

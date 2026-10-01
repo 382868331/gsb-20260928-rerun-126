@@ -134,6 +134,50 @@ func (e *Engine) Close() error {
 	return nil
 }
 
+// RecoveryStatus reconciles the persisted read position with the receiver's
+// confirmations after (re)opening a source.
+//
+// The checkpoint is advanced only after the Output confirms a batch, so
+// Confirmed marks everything the receiver has acknowledged. Anything in the
+// current file beyond Confirmed.Offset (UnconfirmedBytes) will be published
+// now; if the process previously crashed between a successful Publish and the
+// checkpoint write, part of that range was already delivered and will arrive
+// a second time with the SAME Record.ID. Receivers must deduplicate on that
+// ID; the engine itself never knows which prefix of the range was delivered.
+type RecoveryStatus struct {
+	Stream string
+	// Confirmed is the highest receiver-confirmed checkpoint for the stream.
+	Confirmed Checkpoint
+	// SameFile reports whether the path still holds the confirmed file. When
+	// false the file was rotated or recreated while collection was paused and
+	// reading restarts at offset zero of the new file.
+	SameFile bool
+	// UnconfirmedBytes is the amount of data in the current file that is not
+	// covered by Confirmed and is therefore subject to (re)delivery.
+	UnconfirmedBytes int64
+}
+
+// RecoveryStatus reports what is confirmed and what may be republished for
+// this engine's stream, without reading or publishing anything.
+func (e *Engine) RecoveryStatus() RecoveryStatus {
+	status := RecoveryStatus{Stream: e.stream, Confirmed: e.states[e.stream]}
+	id, info, err := fileIDFromPath(e.path)
+	if err != nil {
+		return status
+	}
+	// A zero checkpoint means nothing was ever confirmed: the file is a fresh
+	// start, not a rotation away from a confirmed file.
+	status.SameFile = status.Confirmed.FileID.Inode == 0 || id == status.Confirmed.FileID
+	if status.SameFile {
+		if size := info.Size(); size > status.Confirmed.Offset {
+			status.UnconfirmedBytes = size - status.Confirmed.Offset
+		}
+	} else {
+		status.UnconfirmedBytes = info.Size()
+	}
+	return status
+}
+
 func (e *Engine) Pump(output Output) error {
 	if len(e.pending) > 0 {
 		return e.publish(output)
@@ -283,6 +327,18 @@ func (e *Engine) ensureOpen() error {
 	} else if cp.Offset > 0 || cp.FileID.Inode != 0 {
 		// A checkpoint from a different inode must never be continued as though
 		// the replacement file were the second half of the old file.
+		//
+		// The old file may have ended with an incomplete multiline record whose
+		// parser state was restored from the checkpoint. Finalize it against
+		// the OLD file identity and deliver it as its own record instead of
+		// silently dropping it or, worse, joining it to the head of the new
+		// file. Its Record.ID carries the old inode, so receivers can still
+		// deduplicate it against any pre-rotation delivery.
+		events := e.parser.Flush(e.stream, cp.FileID, true)
+		for i := range events {
+			events[i] = enrichEvent(events[i], e.stream, cp.FileID)
+		}
+		e.pending = append(e.pending, events...)
 		start = 0
 		e.parser.Reset()
 		e.nextLine = 0
@@ -444,7 +500,7 @@ func (e *Engine) saveReadPosition() error {
 		cp.ParserState = raw
 	}
 	e.states[e.stream] = cp
-	return e.store.Save(e.states)
+	return e.store.SaveStream(e.stream, cp)
 }
 
 func (e *Engine) ack(events []Event) error {
@@ -460,7 +516,7 @@ func (e *Engine) ack(events []Event) error {
 		e.safeOffset = 0
 		e.nextLine = 0
 		e.resetCommit = false
-		if err := e.store.Save(e.states); err != nil {
+		if err := e.store.SaveStream(e.stream, cp); err != nil {
 			return err
 		}
 		e.pending = e.pending[:0]
@@ -481,7 +537,7 @@ func (e *Engine) ack(events []Event) error {
 		cp.ParserState = nil
 	}
 	e.states[e.stream] = cp
-	if err := e.store.Save(e.states); err != nil {
+	if err := e.store.SaveStream(e.stream, cp); err != nil {
 		return err
 	}
 	e.delivered = false
