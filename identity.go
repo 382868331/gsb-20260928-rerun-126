@@ -10,5 +10,5 @@ import "fmt"
 // offset produces a different ID. Record content is deliberately not part
 // of the ID and never appears in it, so secrets cannot leak through it.
 func stableRecordID(stream string, fileID FileID, start, end int64) string {
-	return fmt.Sprintf("%s@%d:%d:%d-%d", stream, fileID.Device, fileID.Inode, start, end)
+	return fmt.Sprintf("%s@%d:%d:%d:%d-%d", stream, fileID.Device, fileID.Inode, fileID.Generation, start, end)
 }

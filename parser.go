@@ -26,6 +26,10 @@ type StatefulParser interface {
 	Restore(state any)
 }
 
+type FileBoundaryParser interface {
+	FlushesOnEOF() bool
+}
+
 type StartMatcher func([]byte) bool
 
 func RegexpStart(expr *regexp.Regexp) StartMatcher {
@@ -36,15 +40,16 @@ func AlwaysStart(_ []byte) bool { return true }
 
 // MultilineParser joins continuation lines with the following record start.
 type MultilineParser struct {
-	start     StartMatcher
-	maxBytes  int
-	pending   []byte
-	startOff  int64
-	endOff    int64
-	startLine int
-	lastLine  int
-	has       bool
-	next      StreamingParser
+	start       StartMatcher
+	maxBytes    int
+	pending     []byte
+	startOff    int64
+	endOff      int64
+	startLine   int
+	lastLine    int
+	has         bool
+	next        StreamingParser
+	retainAtEOF bool
 }
 
 func NewMultilineParser(start StartMatcher, maxBytes int, next StreamingParser) *MultilineParser {
@@ -100,6 +105,14 @@ func (p *MultilineParser) Reset() {
 	p.pending = p.pending[:0]
 	p.startOff, p.endOff = 0, 0
 	p.startLine, p.lastLine = 0, 0
+}
+
+func WithMultilineRetainAtEOF(retain bool) func(*MultilineParser) {
+	return func(p *MultilineParser) { p.retainAtEOF = retain }
+}
+
+func (p *MultilineParser) FlushesOnEOF() bool {
+	return !p.retainAtEOF || !p.has
 }
 
 func (p *MultilineParser) emit() []Event {

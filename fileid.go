@@ -10,6 +10,9 @@ import (
 type FileID struct {
 	Device uint64 `json:"device"`
 	Inode  uint64 `json:"inode"`
+	// Generation distinguishes successive epochs when truncation reuses the
+	// same device/inode and byte offsets for different physical content.
+	Generation uint64 `json:"generation,omitempty"`
 }
 
 func fileIDFromFile(f *os.File) (FileID, error) {
@@ -38,6 +41,14 @@ func fileIDFromInfo(st os.FileInfo) (FileID, error) {
 		Device: uint64(sys.Dev),
 		Inode:  uint64(sys.Ino),
 	}, nil
+}
+
+func fileIDFromDirEntry(path string, entry os.DirEntry) (FileID, error) {
+	info, err := entry.Info()
+	if err != nil {
+		return FileID{}, err
+	}
+	return fileIDFromInfo(info)
 }
 
 func (id FileID) String() string {

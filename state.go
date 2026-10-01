@@ -8,10 +8,14 @@ import (
 )
 
 type Checkpoint struct {
-	FileID      FileID          `json:"file_id"`
-	Offset      int64           `json:"offset"`
-	NextLine    int             `json:"next_line"`
-	ParserState json.RawMessage `json:"parser_state,omitempty"`
+	Path                string          `json:"path,omitempty"`
+	FileID              FileID          `json:"file_id"`
+	LastConfirmedFileID FileID          `json:"last_confirmed_file_id,omitempty"`
+	Size                int64           `json:"size,omitempty"`
+	Offset              int64           `json:"offset"`
+	NextLine            int             `json:"next_line"`
+	LastRecordID        string          `json:"last_record_id,omitempty"`
+	ParserState         json.RawMessage `json:"parser_state,omitempty"`
 }
 
 // StateStore stores the highest fully confirmed byte offset for each stream.
