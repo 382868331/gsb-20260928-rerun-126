@@ -54,11 +54,15 @@ type Output interface {
 
 type Engine struct {
 	stream       string
+	consumer     string
 	path         string
 	store        *StateStore
+	abandoned    *AbandonStore
 	parser       StreamingParser
 	maxLine      int
 	readSize     int
+	startLatest  bool
+	fresh        bool
 	states       map[string]Checkpoint
 	file         *os.File
 	id           FileID
@@ -86,6 +90,25 @@ func WithReadSize(n int) Option {
 	return func(e *Engine) { e.readSize = n }
 }
 
+// WithConsumer binds the engine to a persistent consumer identity. Each
+// consumer keeps its own confirmed checkpoint per stream in the shared state
+// file, so one consumer acknowledging a batch never advances another
+// consumer's progress. The empty consumer is the legacy default and keeps
+// the pre-consumer state keys.
+func WithConsumer(name string) Option {
+	return func(e *Engine) { e.consumer = name }
+}
+
+// WithStartFromLatest lets a NEW consumer (no persisted checkpoint for this
+// stream) join at the current end of the file instead of the oldest
+// available byte. The skipped range is reported through RecoveryStatus.Gaps
+// as "skipped_on_join" so the caller can see exactly what is not delivered.
+// It has no effect once a checkpoint exists: rejoining consumers always
+// resume at their own confirmed offset.
+func WithStartFromLatest() Option {
+	return func(e *Engine) { e.startLatest = true }
+}
+
 func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts ...Option) (*Engine, error) {
 	store := NewStateStore(checkpointPath)
 	states, err := store.Load()
@@ -93,13 +116,14 @@ func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts
 		return nil, err
 	}
 	e := &Engine{
-		stream:   stream,
-		path:     path,
-		store:    store,
-		parser:   parser,
-		maxLine:  1 << 20,
-		readSize: 4096,
-		states:   states,
+		stream:    stream,
+		path:      path,
+		store:     store,
+		abandoned: NewAbandonStore(checkpointPath),
+		parser:    parser,
+		maxLine:   1 << 20,
+		readSize:  4096,
+		states:    states,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -110,7 +134,11 @@ func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts
 	if e.readSize < 1 {
 		return nil, errors.New("read size must be positive")
 	}
-	if cp, ok := states[stream]; ok {
+	key := e.stateKey()
+	if _, ok := states[key]; !ok {
+		e.fresh = true
+	}
+	if cp, ok := states[key]; ok {
 		if sp, ok := parser.(StatefulParser); ok && len(cp.ParserState) > 0 {
 			var state any
 			// MultilineParser owns the concrete state shape in this first version.
@@ -126,6 +154,19 @@ func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts
 	}
 	return e, nil
 }
+
+// stateKey scopes the persisted checkpoint by consumer and stream. The
+// default consumer keeps the historical bare-stream keys so existing state
+// files stay valid.
+func (e *Engine) stateKey() string {
+	if e.consumer == "" {
+		return e.stream
+	}
+	return e.consumer + "/" + e.stream
+}
+
+// Consumer returns the persistent identity this engine acknowledges for.
+func (e *Engine) Consumer() string { return e.consumer }
 
 func (e *Engine) Close() error {
 	if e.file != nil {
@@ -146,6 +187,8 @@ func (e *Engine) Close() error {
 // ID; the engine itself never knows which prefix of the range was delivered.
 type RecoveryStatus struct {
 	Stream string
+	// Consumer is the identity this status belongs to.
+	Consumer string
 	// Confirmed is the highest receiver-confirmed checkpoint for the stream.
 	Confirmed Checkpoint
 	// SameFile reports whether the path still holds the confirmed file. When
@@ -155,14 +198,19 @@ type RecoveryStatus struct {
 	// UnconfirmedBytes is the amount of data in the current file that is not
 	// covered by Confirmed and is therefore subject to (re)delivery.
 	UnconfirmedBytes int64
+	// Gaps lists ranges of this stream that are no longer obtainable by this
+	// consumer: rotated away before confirmation, deliberately skipped on
+	// join, or explicitly abandoned. Each gap carries the reason.
+	Gaps []Gap
 }
 
 // RecoveryStatus reports what is confirmed and what may be republished for
 // this engine's stream, without reading or publishing anything.
 func (e *Engine) RecoveryStatus() RecoveryStatus {
-	status := RecoveryStatus{Stream: e.stream, Confirmed: e.states[e.stream]}
+	status := RecoveryStatus{Stream: e.stream, Consumer: e.consumer, Confirmed: e.states[e.stateKey()]}
 	id, info, err := fileIDFromPath(e.path)
 	if err != nil {
+		status.Gaps = e.abandonedGaps(status.Gaps)
 		return status
 	}
 	// A zero checkpoint means nothing was ever confirmed: the file is a fresh
@@ -172,10 +220,42 @@ func (e *Engine) RecoveryStatus() RecoveryStatus {
 		if size := info.Size(); size > status.Confirmed.Offset {
 			status.UnconfirmedBytes = size - status.Confirmed.Offset
 		}
+		if e.fresh && e.startLatest && info.Size() > 0 {
+			status.Gaps = append(status.Gaps, Gap{
+				Stream: e.stream,
+				FileID: id,
+				From:   0,
+				To:     info.Size(),
+				Reason: "skipped_on_join",
+			})
+		}
 	} else {
 		status.UnconfirmedBytes = info.Size()
+		// The confirmed file was rotated away before this consumer confirmed
+		// its tail; that tail is no longer obtainable from the path.
+		status.Gaps = append(status.Gaps, Gap{
+			Stream: e.stream,
+			FileID: status.Confirmed.FileID,
+			From:   status.Confirmed.Offset,
+			To:     -1,
+			Reason: "rotated_before_confirm",
+		})
 	}
+	status.Gaps = e.abandonedGaps(status.Gaps)
 	return status
+}
+
+func (e *Engine) abandonedGaps(gaps []Gap) []Gap {
+	for _, ab := range e.abandoned.For(e.consumer, e.stream) {
+		gaps = append(gaps, Gap{
+			Stream: e.stream,
+			FileID: ab.FileID,
+			From:   ab.From,
+			To:     ab.To,
+			Reason: "abandoned: " + ab.Reason,
+		})
+	}
+	return gaps
 }
 
 func (e *Engine) Pump(output Output) error {
@@ -316,7 +396,7 @@ func (e *Engine) ensureOpen() error {
 	if err != nil {
 		return err
 	}
-	cp := e.states[e.stream]
+	cp := e.states[e.stateKey()]
 	start := int64(0)
 	if cp.FileID == id {
 		if info.Size() < cp.Offset {
@@ -324,6 +404,12 @@ func (e *Engine) ensureOpen() error {
 		}
 		start = cp.Offset
 		e.nextLine = cp.NextLine
+	} else if e.fresh && cp.FileID.Inode == 0 && cp.Offset == 0 {
+		// A brand-new consumer may join at the current end of the file; the
+		// skipped prefix is reported as a gap via RecoveryStatus.
+		if e.startLatest {
+			start = info.Size()
+		}
 	} else if cp.Offset > 0 || cp.FileID.Inode != 0 {
 		// A checkpoint from a different inode must never be continued as though
 		// the replacement file were the second half of the old file.
@@ -364,15 +450,15 @@ func (e *Engine) resetAfterTruncation(currentSize int64) error {
 	}
 	e.parser.Reset()
 	e.pending = append(e.pending, BadRecord{
-		Position: Position{Stream: e.stream, FileID: e.id, Start: e.states[e.stream].Offset, End: currentSize, Line: e.states[e.stream].NextLine},
+		Position: Position{Stream: e.stream, FileID: e.id, Start: e.states[e.stateKey()].Offset, End: currentSize, Line: e.states[e.stateKey()].NextLine},
 		Reason:   "file_truncated",
 	})
-	cp := e.states[e.stream]
+	cp := e.states[e.stateKey()]
 	cp.FileID = FileID{}
 	cp.Offset = 0
 	cp.NextLine = 0
 	cp.ParserState = nil
-	e.states[e.stream] = cp
+	e.states[e.stateKey()] = cp
 	e.resetCommit = true
 	return nil
 }
@@ -488,7 +574,7 @@ func (e *Engine) publish(output Output) error {
 }
 
 func (e *Engine) saveReadPosition() error {
-	cp := e.states[e.stream]
+	cp := e.states[e.stateKey()]
 	cp.FileID = e.id
 	cp.Offset = e.safeOffset
 	cp.NextLine = e.nextLine
@@ -499,31 +585,33 @@ func (e *Engine) saveReadPosition() error {
 		}
 		cp.ParserState = raw
 	}
-	e.states[e.stream] = cp
-	return e.store.SaveStream(e.stream, cp)
+	e.states[e.stateKey()] = cp
+	e.fresh = false
+	return e.store.SaveStream(e.stateKey(), cp)
 }
 
 func (e *Engine) ack(events []Event) error {
 	if e.resetCommit {
-		cp := e.states[e.stream]
+		cp := e.states[e.stateKey()]
 		cp.FileID = FileID{}
 		cp.Offset = 0
 		cp.NextLine = 0
 		cp.ParserState = nil
-		e.states[e.stream] = cp
+		e.states[e.stateKey()] = cp
 		e.id = FileID{}
 		e.offset = 0
 		e.safeOffset = 0
 		e.nextLine = 0
 		e.resetCommit = false
-		if err := e.store.SaveStream(e.stream, cp); err != nil {
+		e.fresh = false
+		if err := e.store.SaveStream(e.stateKey(), cp); err != nil {
 			return err
 		}
 		e.pending = e.pending[:0]
 		return nil
 	}
 
-	cp := e.states[e.stream]
+	cp := e.states[e.stateKey()]
 	cp.FileID = e.id
 	cp.Offset = e.safeOffset
 	cp.NextLine = e.nextLine
@@ -536,8 +624,9 @@ func (e *Engine) ack(events []Event) error {
 	} else {
 		cp.ParserState = nil
 	}
-	e.states[e.stream] = cp
-	if err := e.store.SaveStream(e.stream, cp); err != nil {
+	e.states[e.stateKey()] = cp
+	e.fresh = false
+	if err := e.store.SaveStream(e.stateKey(), cp); err != nil {
 		return err
 	}
 	e.delivered = false
