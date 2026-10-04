@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 )
 
 var (
@@ -56,6 +57,8 @@ type Engine struct {
 	stream       string
 	path         string
 	store        *StateStore
+	consumer     string
+	cstore       *ConsumerStore
 	parser       StreamingParser
 	maxLine      int
 	readSize     int
@@ -86,6 +89,17 @@ func WithReadSize(n int) Option {
 	return func(e *Engine) { e.readSize = n }
 }
 
+// WithConsumer attaches the engine to a persistent consumer identity. The
+// consumer's confirmed checkpoint is tracked independently of every other
+// consumer: confirming a batch advances only this consumer. Consumers that
+// have not explicitly Joined start at JoinOldest.
+func WithConsumer(name string, store *ConsumerStore) Option {
+	return func(e *Engine) {
+		e.consumer = name
+		e.cstore = store
+	}
+}
+
 func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts ...Option) (*Engine, error) {
 	store := NewStateStore(checkpointPath)
 	states, err := store.Load()
@@ -104,13 +118,23 @@ func NewEngine(stream, path, checkpointPath string, parser StreamingParser, opts
 	for _, opt := range opts {
 		opt(e)
 	}
+	if e.cstore != nil {
+		if e.consumer == "" {
+			return nil, errors.New("consumer name must not be empty")
+		}
+		cs, err := e.cstore.ensureConsumer(e.consumer)
+		if err != nil {
+			return nil, err
+		}
+		e.states = cs.Checkpoints
+	}
 	if e.maxLine < 1 {
 		return nil, errors.New("max line bytes must be positive")
 	}
 	if e.readSize < 1 {
 		return nil, errors.New("read size must be positive")
 	}
-	if cp, ok := states[stream]; ok {
+	if cp, ok := e.states[stream]; ok {
 		if sp, ok := parser.(StatefulParser); ok && len(cp.ParserState) > 0 {
 			var state any
 			// MultilineParser owns the concrete state shape in this first version.
@@ -155,6 +179,13 @@ type RecoveryStatus struct {
 	// UnconfirmedBytes is the amount of data in the current file that is not
 	// covered by Confirmed and is therefore subject to (re)delivery.
 	UnconfirmedBytes int64
+	// Gaps lists ranges of this stream that became unavailable while the
+	// consumer was away (rotation or truncation). Only populated when the
+	// engine is attached to a consumer identity.
+	Gaps []Gap
+	// Abandoned lists ranges this consumer deliberately gave up; they are
+	// not part of Confirmed and were never processed successfully.
+	Abandoned []Abandonment
 }
 
 // RecoveryStatus reports what is confirmed and what may be republished for
@@ -175,7 +206,82 @@ func (e *Engine) RecoveryStatus() RecoveryStatus {
 	} else {
 		status.UnconfirmedBytes = info.Size()
 	}
+	if e.cstore != nil {
+		if gaps, err := e.cstore.Gaps(e.stream); err == nil {
+			status.Gaps = gaps
+		}
+		if abandoned, err := e.cstore.Abandonments(e.consumer); err == nil {
+			for _, ab := range abandoned {
+				if ab.Stream == e.stream {
+					status.Abandoned = append(status.Abandoned, ab)
+				}
+			}
+		}
+	}
 	return status
+}
+
+// Abandon gives up the unconfirmed byte range of this stream up to and
+// including offset through, relieving retention pressure on the source. The
+// give-up is recorded as an Abandonment carrying the range and reason; it is
+// persisted separately from the confirmed checkpoint so it can never be
+// mistaken for successfully processed work. The consumer's checkpoint moves
+// to through, so the abandoned range is not read again.
+func (e *Engine) Abandon(through int64, reason string) error {
+	if e.cstore == nil {
+		return errors.New("abandon requires a consumer identity")
+	}
+	if reason == "" {
+		return errors.New("abandon reason must not be empty")
+	}
+	cp := e.states[e.stream]
+	if through <= cp.Offset {
+		return fmt.Errorf("abandon offset %d does not exceed confirmed offset %d", through, cp.Offset)
+	}
+	from := cp.Offset
+	// A record still pending in the parser is unconfirmed too; giving up
+	// history silently dropping it would disguise the give-up as progress.
+	if sp, ok := e.parser.(StatefulParser); ok {
+		if ms, ok := sp.Capture().(multilineState); ok && ms.Has && ms.StartOff < from {
+			from = ms.StartOff
+		}
+	}
+	// Records already read but not yet confirmed by the output are part of
+	// the given-up history as well.
+	if len(e.pending) > 0 {
+		if start := eventPosition(e.pending[0]).Start; start < from {
+			from = start
+		}
+	}
+	ab := Abandonment{
+		Stream: e.stream,
+		FileID: cp.FileID,
+		From:   from,
+		To:     through,
+		Reason: reason,
+		At:     time.Now(),
+	}
+	cp.Offset = through
+	// Line numbering past a skipped range is unknowable without reading it;
+	// record identity never depends on it (see stableRecordID).
+	cp.NextLine = 0
+	cp.ParserState = nil
+	if err := e.cstore.abandon(e.consumer, ab, cp); err != nil {
+		return err
+	}
+	e.states[e.stream] = cp
+	if e.file != nil && e.id == cp.FileID && e.safeOffset < through {
+		if _, err := e.file.Seek(through, io.SeekStart); err != nil {
+			return err
+		}
+		e.offset = through
+		e.safeOffset = through
+		e.carry = e.carry[:0]
+		e.carryStart = through
+		e.nextLine = 0
+		e.parser.Reset()
+	}
+	return nil
 }
 
 func (e *Engine) Pump(output Output) error {
@@ -325,6 +431,7 @@ func (e *Engine) ensureOpen() error {
 		start = cp.Offset
 		e.nextLine = cp.NextLine
 	} else if cp.Offset > 0 || cp.FileID.Inode != 0 {
+		e.noteGap(cp.FileID, cp.Offset, -1, "rotated_away")
 		// A checkpoint from a different inode must never be continued as though
 		// the replacement file were the second half of the old file.
 		//
@@ -358,6 +465,7 @@ func (e *Engine) ensureOpen() error {
 }
 
 func (e *Engine) resetAfterTruncation(currentSize int64) error {
+	e.noteGap(e.states[e.stream].FileID, e.states[e.stream].Offset, -1, "file_truncated")
 	if e.file != nil {
 		_ = e.file.Close()
 		e.file = nil
@@ -500,7 +608,34 @@ func (e *Engine) saveReadPosition() error {
 		cp.ParserState = raw
 	}
 	e.states[e.stream] = cp
+	return e.saveStream(cp)
+}
+
+// saveStream persists the confirmed checkpoint through the consumer store
+// when a consumer identity is attached, so progress is tracked per consumer;
+// otherwise it falls back to the shared per-stream checkpoint file.
+func (e *Engine) saveStream(cp Checkpoint) error {
+	if e.cstore != nil {
+		return e.cstore.SaveStream(e.consumer, e.stream, cp)
+	}
 	return e.store.SaveStream(e.stream, cp)
+}
+
+// noteGap records an unavailable range for this consumer's stream. Gaps are
+// informational; a failure to record one must not interrupt collection.
+func (e *Engine) noteGap(id FileID, from, to int64, reason string) {
+	if e.cstore == nil || id.Inode == 0 {
+		return
+	}
+	_ = e.cstore.noteGap(Gap{
+		Consumer: e.consumer,
+		Stream:   e.stream,
+		FileID:   id,
+		From:     from,
+		To:       to,
+		Reason:   reason,
+		At:       time.Now(),
+	})
 }
 
 func (e *Engine) ack(events []Event) error {
@@ -516,7 +651,7 @@ func (e *Engine) ack(events []Event) error {
 		e.safeOffset = 0
 		e.nextLine = 0
 		e.resetCommit = false
-		if err := e.store.SaveStream(e.stream, cp); err != nil {
+		if err := e.saveStream(cp); err != nil {
 			return err
 		}
 		e.pending = e.pending[:0]
@@ -537,7 +672,7 @@ func (e *Engine) ack(events []Event) error {
 		cp.ParserState = nil
 	}
 	e.states[e.stream] = cp
-	if err := e.store.SaveStream(e.stream, cp); err != nil {
+	if err := e.saveStream(cp); err != nil {
 		return err
 	}
 	e.delivered = false
