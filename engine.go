@@ -415,6 +415,18 @@ func (e *Engine) finishCurrentFile(output Output) error {
 }
 
 func (e *Engine) ensureOpen() error {
+	if e.file != nil {
+		// Reopening while bytes already read past the confirmed offset live in
+		// carry would splice those bytes into the next line a second time and
+		// corrupt records depending purely on the read size. Only reopen when
+		// the descriptor sits exactly at the confirmed boundary with no partial
+		// line in memory; the two states are then identical byte-for-byte.
+		if len(e.carry) > 0 || e.offset != e.safeOffset {
+			return nil
+		}
+		_ = e.file.Close()
+		e.file = nil
+	}
 	id, info, err := fileIDFromPath(e.path)
 	if os.IsNotExist(err) {
 		return nil
