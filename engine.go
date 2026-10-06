@@ -415,6 +415,24 @@ func (e *Engine) finishCurrentFile(output Output) error {
 }
 
 func (e *Engine) ensureOpen() error {
+	// An already-open file must be kept: its read position may be ahead of
+	// the confirmed checkpoint with a partial record held in carry. Reopening
+	// here would seek back to the confirmed offset and read those carried
+	// bytes a second time, corrupting the record being assembled.
+	if e.file != nil {
+		// Probe the path without disturbing the open handle, so a source
+		// that became unreadable is reported instead of silently read from
+		// the stale descriptor.
+		probe, err := os.Open(e.path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		probe.Close()
+		return nil
+	}
 	id, info, err := fileIDFromPath(e.path)
 	if os.IsNotExist(err) {
 		return nil
